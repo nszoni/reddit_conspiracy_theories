@@ -1,2 +1,5 @@
-# ceu_pta_final_project
-CEU Python Text Analysis Class Winter 2022
+# Reddit r/ConspiracyTheories Sentiment and Topic Modelling Analysis
+
+To be available in the following languages:
+- Python
+- R
