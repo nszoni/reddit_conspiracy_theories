@@ -1,0 +1,14 @@
+---
+title: "Reddit Conspiracy Theories Analysis"
+author: "Son N. Nguyen"
+date: "`r format(Sys.time(), '%d %B %Y')`"
+output:
+  pdf_document:
+    fig_caption: yes
+    latex_engine: xelatex
+urlcolor: blue
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, messages = FALSE, tidy.opts=list(width.cutoff=40),tidy=TRUE, fig.align = 'center', cache=TRUE)
+```
