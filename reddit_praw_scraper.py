@@ -3,7 +3,6 @@ import praw
 import pandas as pd
 from datetime import datetime as dt
 from tqdm import tqdm
-import time
 
 
 def get_date(created) -> str:
@@ -27,9 +26,15 @@ def reddit_connection():
 
 def build_dataset(reddit, search_words='conspiracy', items_limit=3000, ubound=2000, lbound=2099, time_filter='all') -> pd.DataFrame:
     
-    # Collect reddit posts
+    
     subreddit = reddit.subreddit(search_words)
+
+    # Collect top, hot, rising, new reddit posts and merge it together to generate data
     top_subreddit = subreddit.top(time_filter, limit=items_limit)
+    hot_subreddit = subreddit.hot(limit=items_limit)
+    rising_subreddit = subreddit.rising(limit=items_limit)
+    new_subreddit = subreddit.new(limit=items_limit)
+
     topics_dict = { "title":[],
                 "score":[],
                 "id":[], "url":[],
@@ -38,19 +43,21 @@ def build_dataset(reddit, search_words='conspiracy', items_limit=3000, ubound=20
                 "body":[]}
     
     #controversies before the pandemix (before first case in Wuhan)
-    print(f"retrieve top reddit posts ...")
-    for submission in tqdm(top_subreddit):
-        if dt.fromtimestamp(submission.created_utc).year <= ubound and dt.fromtimestamp(submission.created_utc).year >= lbound:
-            topics_dict["title"].append(submission.title)
-            topics_dict["score"].append(submission.score)
-            topics_dict["id"].append(submission.id)
-            topics_dict["url"].append(submission.url)
-            topics_dict["comms_num"].append(submission.num_comments)
-            topics_dict["created"].append(submission.created)
-            topics_dict["body"].append(submission.selftext)
+    print(f"retrieve reddit posts ...")
+    for sub in (top_subreddit, hot_subreddit, rising_subreddit, new_subreddit):
+        for submission in tqdm(sub):
+            if dt.fromtimestamp(submission.created_utc).year <= ubound and dt.fromtimestamp(submission.created_utc).year >= lbound:
+                topics_dict["title"].append(submission.title)
+                topics_dict["score"].append(submission.score)
+                topics_dict["id"].append(submission.id)
+                topics_dict["url"].append(submission.url)
+                topics_dict["comms_num"].append(submission.num_comments)
+                topics_dict["created"].append(submission.created)
+                topics_dict["body"].append(submission.selftext)
 
+    print(f"retrieve reddit comments ...")
     for comment in tqdm(subreddit.comments(limit=2000)):
-        if dt.fromtimestamp(submission.created_utc).year <= ubound and dt.fromtimestamp(submission.created_utc).year >= lbound:
+        if dt.fromtimestamp(comment.created_utc).year <= ubound and dt.fromtimestamp(comment.created_utc).year >= lbound:
             topics_dict["title"].append("Comment")
             topics_dict["score"].append(comment.score)
             topics_dict["id"].append(comment.id)
@@ -84,8 +91,8 @@ def update_and_save_dataset(topics_df, ubound='', lbound=''):
 
 
 if __name__ == "__main__":
-    lbound = 2016
-    ubound = 2020
+    lbound = 2021
+    ubound = 2022
     time_filter = 'all'
     reddit = reddit_connection()
     topics_data_df = build_dataset(reddit, ubound=ubound, lbound=lbound, time_filter=time_filter)
