@@ -74,7 +74,7 @@ def build_dataset(reddit, search_words='conspiracy', items_limit=3000, ubound=20
    
 
 def update_and_save_dataset(topics_df, ubound='', lbound=''):   
-    file_path = f"data/reddit_ct_{lbound}_{ubound}.csv"
+    file_path = f"../data/reddit_ct_{lbound}_{ubound}.csv"
     topics_df.to_csv(file_path, index=False)
     print(f"dataset saved to {file_path}")
     if os.path.exists(file_path):

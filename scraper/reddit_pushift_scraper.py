@@ -75,7 +75,7 @@ def get_data(gen, reddit) -> pd.DataFrame:
     return submissions_df
 
 def save_data(submissions_df, ubound = '', lbound = ''):
-    submissions_df.to_csv(f'./data/reddit_ct_pushift_{lbound}_{ubound}.csv', header=True, index=False)
+    submissions_df.to_csv(f'../data/reddit_ct_pushift_{lbound}_{ubound}.csv', header=True, index=False)
 
 
 if __name__ == "__main__":
