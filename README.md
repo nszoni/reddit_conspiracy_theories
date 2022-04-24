@@ -1,4 +1,4 @@
-# Reddit r/ConspiracyTheories Sentiment and Topic Modelling Analysis
+# Reddit r/conspiracy Sentiment and Topic Modelling Analysis
 
 To be available in the following languages:
 - Python
