@@ -1,14 +1,888 @@
 ---
-title: "Reddit Conspiracy Theories Analysis"
+title: "How the Pandemic Changed Conspiracy Theories on Reddit?"
+subtitle: "Sentiment Analysis and Topic Modelling"
 author: "Son N. Nguyen"
 date: "`r format(Sys.time(), '%d %B %Y')`"
 output:
-  pdf_document:
+  html_document:
     fig_caption: yes
-    latex_engine: xelatex
+    toc: yes
+    theme: united
+    code_folding: hide
 urlcolor: blue
 ---
 
 ```{r setup, include=FALSE}
-knitr::opts_chunk$set(echo = TRUE, warning = FALSE, messages = FALSE, tidy.opts=list(width.cutoff=40),tidy=TRUE, fig.align = 'center', cache=TRUE)
+
+knitr::opts_chunk$set(echo = TRUE,
+                      warning = FALSE,
+                      messages = FALSE,
+                      tidy.opts = list(width.cutoff = 40),
+                      tidy = TRUE,
+                      fig.align = 'center',
+                      cache = TRUE)
+
 ```
+
+```{r requirements, message=F}
+
+library(tidyverse)
+library(readr)
+library(tidytext)
+library(glmnet)
+library(sentimentr)
+library(igraph)
+library(ggraph)
+library(stopwords)
+library(topicmodels)
+library(kableExtra)
+library(wordcloud)
+library(ggpubr)
+library(textstem)
+library(emo)
+library(widyr)
+library(reshape2)
+library(tm)
+library(ldatuning)
+
+```
+
+## Hypothesis
+
+My hypothesis is that since the pandemic, there has been more activity and discussions have been more aggressive in the r/conspiracy subreddit. To find that out, my idea was to use sentiment analysis and entity recognition to find out how things have changed in the post-covid world.
+
+Besides, I wanted to see using LDA topic modelling whether topics have been shifted from vaccines, global warming, 5G to other, maybe related to the war, the BLM movement, LGBTQ etc. I believe that there is a trend towards the discussion of human rights and questions revolving around media and society.
+
+## Data Collection
+
+### Kaggle
+
+Initially, my plan was to used a dataset publicly available on [Kaggle](https://www.kaggle.com/datasets/gpreda/reddit-conspiracy-theory). It is claimed to be updated daily but the dataset is relatively small and does not cover well enough the targeted periods. Since there were no external data sources available out of the box, I decided to scrape it myself from the Reddit API.
+
+### Scraping the Reddit API
+
+The traditional way of scraping Reddit is to use the API with the PRAW wrapper. However, the API is limited to 1000 requests per hour and is not able to scrape historical data defined by a window. This is not enough for our purposes and our data would be highly unbalanced and unrepresentative.
+
+> [PRAW](https://github.com/praw-dev/praw), an acronym for "Python Reddit API Wrapper", is a Python package that allows for simple access to Reddit's API.
+
+#### Overcoming limitations of the Reddit API with Pushift API
+
+Luckily there is a service which allows us to scrape historical data from Reddit. The service is called [Pushift API](https://github.com/pushshift/api). Briefly, it let's you control the scraping window. The python wrapper of the API is called PSAW, but there is also a multi-threaded version called PMAW which is more efficient in high volumes close to hundreds of thousands of records.
+
+> “Pushshift makes it much easier for researchers to query and retrieve historical Reddit data, provides extended functionality by providing fulltext search against comments and submissions, and has larger single query limits.” PSAW, meanwhile, makes it easier to work with Pushshift and provides better documentation."
+
+#### Scraping process
+
+I have used a methodology which blends together the usage of the classical PRAW and PSAW. With PSAW, we only get unique identifiers of submissions from the API bounded by time, which then we feed it to PRAW's submission endpoint. This way, we can get more features offered by PRAW but overcome its limitation of scraping historical data. For a more detailed reference check out this blogpost [here](https://towardsdatascience.com/how-to-collect-a-reddit-dataset-c369de539114).
+
+The script used for scraping can be found in the project's root directory under the name `reddit_pushift_scraper.py`.
+
+## Data Ingestion
+
+I have scraped **2500 submissions between 2018 and 2019** for the analysis of conspiracy theories and subreddit activity. For comparison, I also got submission-level data between **2021 and 2022** which should be the baseline for the aftermath of the global pandemic.
+
+The dataset consists the following columns:
+- **id:** unique identifier of the submission
+- **author:** author of the submission
+- **url:** url of the submission
+- **title:** title of the submission
+- **score:** number of upvotes
+- **created:** UNIX timestamp of the submission
+- **body:** body text of the submission
+
+### Pre-covid conspiracy posts between 2018 and 2019
+
+```{r ingest pre}
+
+precovid <- read.csv('../data/reddit_ct_pushift_2018_2019.csv', header=T)
+
+precovid |>
+  head(3)  |>
+  select(-c('body')) |>
+  kable(digits = 3, caption = 'Table 1: Raw Precovid Posts', booktabs = TRUE) |>
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = F) |> 
+  scroll_box(width = "100%")
+
+```
+
+### Post-covid top conspiracy post between 2021 and 2022
+
+```{r ingest post}
+
+postcovid <- read.csv('../data/reddit_ct_pushift_2021_2022.csv', header=T)
+
+postcovid |>
+  head(3)  |>
+  select(-c('body')) |>
+  kable(digits = 3, caption = 'Table 2: Raw Postcovid Posts', booktabs = TRUE) |>
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = F) |> 
+  scroll_box(width = "100%")
+
+```
+
+## Data Cleaning
+
+First, I wanted to label each dataset before concatenating them to segment by the pre-covid and post-covid data in later analyses. The creation date was given in UNIX time in the raw data which had to be converted into a human-readable format.
+
+```{r clean}
+
+#label dataframes
+precovid <- precovid |> mutate(label = 'precovid')
+postcovid <- postcovid |> mutate(label = 'postcovid')
+
+#union tables
+rc  <- rbind(precovid, postcovid) |> 
+          mutate(timestamp = as.POSIXct(created, origin='1970-01-01'))
+
+rc$label <- factor(rc$label, levels=c('precovid','postcovid'))
+
+rc |>
+  head(2)  |>
+  kable(digits = 3, caption = 'Table 3: Labelled and Timestamped data', booktabs = TRUE) |>
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = F) |> 
+  scroll_box(width = "100%")
+
+```
+
+### Feature generation
+
+We have seen that there are posts with deleted or removed content either because of the violation of user terms ( let's face it happens often in similar forums) or the author itself decided to delete them. This introduces many records which are not usable for the analysis.
+
+We could do the analysis separately for post titles and body texts, but it would mean that we lose significant amount of data due to fanning through post which only have a title.
+
+As a result, I have decided to keep the analysis concise and glue together the two features. The limitation of this maneuver is that there are cases where the titles are just the first line of the body text, thus we would end up in information duplication.
+
+```{r features}
+
+#replace pattern delete and removed with missing
+rc <- rc |> mutate(body = gsub("\\[deleted\\]|\\[removed\\]", "", body))
+
+#glue together titles and bodies
+rc$text <- paste(rc$title, rc$body, sep = " ")
+
+#drop columns
+rc <- select(rc, -c('url', 'created', 'body', 'title'))
+
+rc |>
+  head(2)  |>
+  kable(digits = 3, caption = 'Table 4: Glued Dataframe', booktabs = TRUE) |>
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = F) |> 
+  scroll_box(width = "100%")
+
+```
+
+As the last part of our cleaning process, let's check whether there exist any duplicates, missing values, or fields with solely white spaces. Fortunately, I managed to avoid any missing values in the textual data with gluing together titles and submission bodies (which is crucial). Also there are no duplication of records, nor any text values which consist only white spaces.
+
+```{r tidy}
+
+# check missing values and duplicates
+any(is.na(rc$text))
+
+#check duplicates
+any(duplicated(rc))
+
+#check whitespaces
+any(length(trimws(rc$text)) == 0)
+
+#no duplicates, missing values, or whitespace fields
+dim(rc)
+
+```
+
+We have in total 5000 submissions.
+
+## Text Processing
+
+### Extend stopwords corpus
+
+The tidytext stopwords corpus is a list of words that are considered irrelevant in the context of text analysis. It is much more extensive than let's say the nltk stopword corpus in Python (thanks to the multiple of lexicons it uses). However, I have still arbitrarily extended the corpus with words which does not add to the meaning of the text, but I expect to come up very often based on my experience with nltk.
+
+```{r stopwords}
+
+#collect stopwords
+data(stop_words)
+
+extension <- c('use', 'people', 'person', 'like',
+               'think', 'know', 'case', 'want',
+               'mean', 'one', 'many', 'well', 'two',
+               'say', 'would', 'make', 'get',
+               'go', 'thing', 'much', 'time', 'even',
+               'new', 'also', 'could')
+
+#create dataframe for extensions
+extension_df <- data.frame(word = extension, lexicon = rep('custom', length(extension)))
+
+stop_words <- rbind(stop_words, extension_df)
+
+stop_words |>
+  head(5)  |>
+  kable(digits = 3, caption = 'Table 5: Stopwords') |>
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = F)
+
+```
+
+I have created a text processer function which cleans the text from noises (e.g. username handlers, hyperlinks, non-alphabetic elements, whitespaces, etc.) as well as tokenizes the text, removes stopwords, lemmatizes the generated tokens and filters out all the words which have less characters than three.
+
+```{r preprocess}
+
+text_preprocesser <- function(text){
+
+    ###########################
+  
+    #remove handlers (eg. @username)
+    #remove urls
+    #remove any non-word elements (inc. punctuation)
+    #remove single letters
+    #remove digits
+    #replace multiple spaces with a single space
+    #tokenize text
+    #filter out stopwords
+    #lemmatize tokens
+    #filter out tokens with less than 3 characters
+  
+    ###########################
+  
+  #lowercase text
+  text <- tolower(text)
+
+  #remove junk
+  pattern <- "@[^\\s]+|http\\S+|\\W|\\s+[a-zA-Z]\\s+|\\d+|\\s+"
+  text <- gsub(pattern, " ", text)
+
+  #split to tokens
+  tokens <- unlist(strsplit(text, '\\s+'))
+
+  #filter out stopwords
+  tokens <- tokens[!(tokens %in% stop_words$word)]
+
+  #lemmatize tokens
+  tokens <- lemmatize_words(tokens)
+
+  #filter out tokens with less than 3 characters
+  tokens <- tokens[length(tokens) >= 3]
+  
+  #join words back together
+  preprocessed_text <- paste(tokens, collapse = " ")
+
+  return(preprocessed_text)
+
+}
+
+```
+
+Applying the text preprocesser, we can see that it did a good job in overall as we managed to filter out stopwords and introduce standardized corpus of lemmatized words. Notice that by removing 'in' from the first post, we lose a bit of context.
+
+```{r preprocess2}
+
+rc$cleaned <- lapply(rc$text, text_preprocesser)
+
+rc |>
+  head(2)  |>
+  kable(digits = 3, caption = 'Table 6: Preprocessed Dataframe', booktabs = TRUE) |>
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = F) |> 
+  scroll_box(width = "100%")
+
+```
+
+### Feature Extraction
+
+Let's carve out some naive metrics like the number of words, stopwords, the average word length, and the number of question marks. My assumption when discussing conspiracy theories, we tend to use more question marks indicating our uncertainty.
+
+```{r extract}
+
+#count number of words
+rc$word_count <- sapply(strsplit(rc$text, " "), length)
+
+
+#count number words in stop_words
+rc$stopword_count <- sapply(strsplit(rc$text, " "), function(x){
+  sum(tolower(x) %in% stop_words$word)
+})
+
+#count number of question marks
+rc$questions_count <- str_count(rc$text, "\\?")
+
+#calc average word length
+words <- strsplit(rc$text, " ")
+word_lengths <- lapply(words, str_length)
+rc$avg_word_length <-sapply(word_lengths, mean)
+
+```
+
+### Extract emojis
+
+When analyzing social media data, we cannot skip past the fact that there is a trend towards people expressing themselves through emojis and it slowly replaces the means of communication through actual words.
+
+My intention here was to prepare the dataset for analyzing the commonly used emojis across multiple segments (period or sentiment), therefore I have collected all the emojis a submission to a list and added a counter for each.
+
+```{r emoji_extract}
+
+rc <- rc |>
+  mutate(emoji = emo::ji_extract_all(text))
+
+rc$emoji_count <- sapply(rc$emoji, length)
+
+#does not get the full set of emojis
+rc |>
+  filter(emoji_count > 2, nchar(text) < 100) |> 
+  kable(digits = 3, caption = 'Table 7: Preprocessed Dataframe', booktabs = TRUE) |>
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = F) |> 
+  scroll_box(width = "100%")
+
+```
+
+## EDA
+
+### Naive Features
+
+We can make the following remarks based on the barplots below:
+
+- The average word length did not change
+- The average number of words used in a post has decreased since COVID
+- The average number of question marks has increased since COVID indicating a marginally larger uncertainty
+- The average number of emojis within a post also increased suggesting a different way of expression and how emojis became a standard of communication
+
+```{r eda}
+
+# barplot of average word length per label
+g1 <- rc |>
+  group_by(label) |>
+  summarize(avg_word_length = mean(avg_word_length)) |>
+  ggplot(aes(label, avg_word_length, fill = label)) + 
+  geom_bar(stat = "identity") +
+  labs(
+    title = 'Avg. word length',
+    x = '',
+    y = 'Length'
+  ) +
+  theme(legend.position="none")
+
+#barplot of number of words per label
+g2 <- rc |>
+  group_by(label) |>
+  summarize(word_count = mean(word_count)) |>
+  ggplot(aes(label, word_count, fill = label)) +  
+  geom_bar(stat = "identity") +
+  labs(
+    title = '# of Words',
+    x = '',
+    y = 'Count'
+  ) +
+  theme(legend.position="none")
+
+#barplot of number of question marks per label
+g3 <- rc |>
+  group_by(label) |>
+  summarize(questions_count = mean(questions_count)) |>
+  ggplot(aes(label, questions_count, fill = label)) + 
+  geom_bar(stat = "identity") +
+  labs(
+    title = '# of Question marks',
+    x = '',
+    y = 'Count'
+  ) +
+  theme(legend.position="none")
+
+#barplot of number of emojis per label
+g4 <- rc |>
+  group_by(label) |>
+  summarize(emoji_count = mean(emoji_count)) |>
+  ggplot(aes(label, emoji_count, fill = label)) + 
+  geom_bar(stat = "identity") +
+  labs(
+    title = '# of Emojis',
+    x = '',
+    y = 'Count'
+  ) +
+  theme(legend.position="none")
+
+g_interactions <- ggarrange(g1, g2, g3, g4, ncol=2, nrow=2)
+title <- expression(atop(bold("Figure 1: Naive Feature Extraction"), scriptstyle("Comparing posting styles")))
+annotate_figure(g_interactions,top = text_grob(title, color = "#2ca25f", face = "bold", size = 14))
+
+```
+
+### Correlations between numeric features
+
+I also wanted to see that among the numerical dimensions of a submission, which metrics correlate with each other. It seems that upvote and comments are moving ahnd-in-hand as there is a positive correlation of 0.76 between them.
+
+```{r corrplot}
+
+cols <- c('score', 'num_comments', 'word_count', 'questions_count', 'avg_word_length')
+
+#correlation map
+corr_mat <- round(cor(rc[, cols], use="complete"), 2)
+
+# reduce the size of correlation matrix
+melted_corr_mat <- melt(corr_mat)
+head(melted_corr_mat)
+ 
+# plotting the correlation heatmap
+corrplot <- ggplot(data = melted_corr_mat, aes(x=Var1, y=Var2,
+                                   fill=value)) +
+  geom_tile(color = 'black') +
+  geom_text(aes(Var2, Var1, label = value),
+            color = "black", size = 4) +
+  labs(
+    y = '',
+    x = '',
+    caption = "Data Source: r/conspiracy"
+  ) +
+  scale_fill_gradient(low = "white", high = "red")  +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+
+title <- expression(atop(bold("Figure 2: Correlation Matrix of Numerics"), scriptstyle("Words-Questions and Score-Comments moving together -- not surprising")))
+annotate_figure(corrplot,top = text_grob(title, color = "#2ca25f", face = "bold", size = 14))
+
+```
+
+### Sentiment Distribution
+
+Using the bing lexicon which categorizes each word in a binary fashion (negative or positive), we can observe that the number of negative words remained very much the same but the number of positive words decayed over time.
+
+```{r sentiments}
+
+sentiments_by_period <- rc |>
+  select(label, cleaned) |> 
+  unnest_tokens(output = word, input = cleaned) |>
+  inner_join(get_sentiments("bing"), by = "word") |> 
+  ggplot() +
+  geom_histogram(aes(sentiment, fill=sentiment), stat="count") +
+  labs(
+    x = ''
+  ) +
+  theme(legend.position = 'None') +
+  facet_wrap(~label) +
+  coord_flip()
+
+title <- expression(atop(bold("Figure 3: Distribution of sentiments by period"), scriptstyle("Less positivity since COVID")))
+annotate_figure(sentiments_by_period, top = text_grob(title, color = "#2ca25f", face = "bold", size = 14))
+
+```
+
+## TF-IDF
+
+To see what key terms drive each submission by fitting a tf-idf model to the cleaned text.
+
+> The idea of tf-idf is to find the important words for the content of each document by decreasing the weight for commonly used words and increasing the weight for words that are not used very much in a collection or corpus of documents
+
+```{r tfidf}
+
+rc_tfidf <- rc |>
+  unnest_tokens(word, cleaned) |>
+  count(label, word, sort = TRUE) |>
+  ungroup()
+
+total_words <- rc_tfidf |> 
+  group_by(label) |> 
+  summarize(total = sum(n))
+
+rc_tfidf  <- left_join(rc_tfidf, total_words)
+
+rc_tfidf <- rc_tfidf |>
+  bind_tf_idf(word, label, n)
+
+tfidf <- rc_tfidf |>
+  arrange(desc(tf_idf)) |>
+  mutate(word = factor(word, levels = rev(unique(word)))) |> 
+  group_by(label) |> 
+  top_n(10) |> 
+  ungroup() |>
+  ggplot(aes(word, tf_idf, fill = label)) +
+  geom_col(show.legend = FALSE) +
+  labs(x = NULL, y = "tf-idf") +
+  facet_wrap(~label, scales = "free") +
+  coord_flip()
+
+title <- expression(atop(bold("Figure 4: High tf-idf words"), scriptstyle("Tiananmen square protest and sexual misconducts topping pre-COVID times while COVID words spill to the ex-post")))
+annotate_figure(tfidf,top = text_grob(title, color = "#2ca25f", face = "bold", size = 14))
+
+```
+
+It seems that keywords connected to the Kevin Spacey scandal and political conflict were the most relevant words of submissions before COVID. After the pandemic, keywords of the vaccination has greatly emerged as the drivers of controversies.
+
+## Sentiment Analysis
+
+As a start for my sentiment analysis, I wanted to catch the differences between the two periods on the token-level, then look at sentiments of the submission itself.
+
+To rank each word by the total sentiment contribute, I have used the AFINN lexicon, and summed up all the scores per label to get the total contribution of a word.
+
+> The AFINN lexicon is a list of English terms manually rated for valence with an integer between -5 (negative) and +5 (positive) by Finn Årup Nielsen between 2009 and 2011.
+
+The below graph suggests that there is a considerable amount of overlap between positive and negative terms pre and post COVID. If we had to pick out certain words which have defined the period would be **abuse** for pre-covid because of all the sexual misconducts and **ban**, **pay** and **crisis** from postcovid because of the follow-up economic decline after the pandemic and all words related to the sanctions towards Russia.
+
+```{r afinn}
+
+precovid_sent <- rc |>
+  filter(label == 'precovid') |> 
+  select(cleaned) |> 
+  unnest_tokens(output = word, input = cleaned) |>
+  inner_join(get_sentiments("afinn"), by = "word") |>
+  group_by(word) |>
+  summarise(total = sum(value)) |> #total contribution to overall sentiment
+  filter(!total %in% c(-25:0,0:25)) |>
+  filter(abs(total) > 100) |> 
+  ggplot(aes(x = fct_reorder(word,-total),
+             y = total)) +
+  geom_col(aes(fill = ifelse(total > 0,"red", "blue")), show.legend = FALSE) +
+    coord_flip()+
+  theme(axis.text.y = element_text(size = 7)) +
+  theme(legend.position = "none") +
+  labs(fill = "Year") +
+  labs(
+    title = "Pre-COVID Sentiments",
+    y = "Total Contribution",
+    x = '',
+    caption = ''
+  )
+
+postcovid_sent <- rc |>
+  filter(label == 'postcovid') |> 
+  select(cleaned) |> 
+  unnest_tokens(output = word, input = cleaned) |>
+  inner_join(get_sentiments("afinn"), by = "word") |>
+  group_by(word) |>
+  summarise(total = sum(value)) |> #total contribution to overall sentiment
+  filter(!total %in% c(-25:0,0:25)) |>
+  filter(abs(total) > 100) |> 
+  ggplot(aes(x = fct_reorder(word,-total),
+             y = total)) +
+  geom_col(aes(fill = ifelse(total > 0,"red", "blue")), show.legend = FALSE) +
+    coord_flip()+
+  theme(axis.text.y = element_text(size = 7)) +
+  theme(legend.position = "none") +
+  labs(fill = "Year") +
+  labs(
+    title = "Post-COVID Sentiments",
+    caption = "Data source: r/conspiracy",
+    y = "Total Contribution",
+    x = ''
+  )
+
+gsentiments <- ggarrange(precovid_sent, postcovid_sent)
+title <- expression(atop(bold("Figure 6: Positive & Negative w/ High Contribution"), scriptstyle("There is a considerable amount of overlap between the two periods")))
+annotate_figure(gsentiments,top = text_grob(title, color = "#2ca25f", face = "bold", size = 14))
+
+```
+
+### Sentiment Categories
+
+We can also leverage other sentiment lexicons such as NRC, which is great for identifying sentiment categories.
+
+> The NRC Emotion Lexicon is a list of English words and their associations with eight basic emotions (anger, fear, anticipation, trust, surprise, sadness, joy, and disgust) and two sentiments (negative and positive). The annotations were manually done by crowdsourcing.
+
+We can see that the ranking between categories didn't change much, except for there is relatively more words connected to trust. This is mildly connected to the amplified uncertainty after the vaccination myths, where people are questioning trust in others.
+
+```{r categories}
+
+sentiment_cat<-rc |>
+  select(label, cleaned) |> 
+  unnest_tokens(output = word, input = cleaned) |>
+  inner_join(get_sentiments('nrc')) |>
+  group_by(label) |> 
+  count(sentiment)
+
+gcategories <- ggplot(sentiment_cat, aes(x=reorder(sentiment, n), y=n, fill=sentiment)) +
+  geom_col(show.legend=F) + coord_flip() +
+  geom_text(aes(label=n), hjust=1.15) +
+    labs(
+        x="",
+        y=""
+        ) +
+  facet_wrap(~label)
+
+title <- expression(atop(bold("Figure 7: Comparison of Sentiment Categories"), scriptstyle("Relatively more words revolving around trust?")))
+annotate_figure(gcategories,top = text_grob(title, color = "#2ca25f", face = "bold", size = 14))
+
+
+```
+
+### Emoji Analysis
+
+Using the list of emojis collected in the text processing section, we can see how the most frequently used emojis have changed over time. Unfortunately, R hasn't got a clear solution of rendering emojis on plots, therefore I have used a tabular representation of the data.
+
+We can see that the top 2 emojis did not change, just swapped places (thinking and joy emoji). There are more negative emojis in post-COVID (e.g. skull, clown, suspicious eyes). We can also see that national flags appear in both terms. In the former, its the Albanian allegedly (had to Google myself) because of Dua Lipa's tweet backing Albanian nationalism. In the latter, it is Ukraine where there is a war ongoing with Russian aggressors.
+
+```{r emojis}
+
+#top 5 emojis in each period
+#precovid
+preemojis <- rc |>
+  filter(label == "precovid") |> 
+  unnest(cols = c(emoji)) |>
+  count(emoji, sort = TRUE) |> 
+  slice(1:10)
+
+#postcovid 
+postemojis <- rc |>
+  filter(label == "postcovid") |> 
+  unnest(cols = c(emoji)) |>
+  count(emoji, sort = TRUE) |> 
+  slice(1:10)
+
+kable(list(preemojis, postemojis), caption = "Table 8: Most Frequent Emojis", col.names = NULL, align='c') |> 
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = F) |> 
+  add_header_above(c("Pre-COVID" = 1, "Post-COVID" = 1))
+
+```
+
+### Wordclouds
+
+If we check the words associated with sentiments via the bing lexicon, we can see the most common ones in the word clouds below. Conspiracy is still the most used negative word while Trump is the top positive. 
+
+If we look closely to the words which are not overwhelming the rest, we can see that the difference is shifting from abuse, mysterious aliens, impeachment and prison (associated with Harvey Weinstein, UFO findings, Trump, and Jeffrey Epstein, respectively) to virus, bomb, and crisis. As far as positive shift is concerned, there is much less specificity.
+
+```{r wc, fig.width=12, fig.height=8}
+
+par(mfrow=c(1,2))
+
+set.seed(1134)
+
+rc |>
+  filter(label == 'precovid') |> 
+  unnest_tokens(output = word, input = cleaned) |>
+  inner_join(get_sentiments('bing'), by = "word") |>
+  count(sentiment, word, sort = TRUE) |>
+  pivot_wider(names_from = sentiment,
+              values_from = n,
+              values_fill = 0) |>
+  column_to_rownames(var = "word") |>
+  comparison.cloud(
+    colors = c("#ff7f00", "#1f78b4"),
+    max.words = 100,
+    title.size = 1.5,
+    title.colors = c("#ff7f00", "#1f78b4")
+  )
+text(x=0.5, y=1, "Pre-COVID")
+
+wc <- rc |>
+  filter(label == 'postcovid') |> 
+  unnest_tokens(output = word, input = cleaned) |>
+  inner_join(get_sentiments('bing'), by = "word") |>
+  count(sentiment, word, sort = TRUE) |>
+  pivot_wider(names_from = sentiment,
+              values_from = n,
+              values_fill = 0) |>
+  column_to_rownames(var = "word") |>
+  comparison.cloud(
+    colors = c("#ff7f00", "#1f78b4"),
+    max.words = 100,
+    title.size = 1.5,
+    title.colors = c("#ff7f00", "#1f78b4")
+  )
+text(x=0.5, y=1, "Post-COVID")
+
+```
+
+## Entity Analysis
+
+### Bigrams
+
+Extending the analysis to multiple words can be a good idea. Thus, I did a tf-idf analysis on bigrams within each submission. On the precovid side, words strongly connected with Epstein (die suicide, epstein die, manhattan jail) and UFO controversies (strange creature, creature forest) are among the key bigrams, while in the post-COVID period, bigrams are mosre dispersed in terms of topics ranging from vaccination through gender (conceptual penis) to sexism (amp amp).
+
+```{r bigrams}
+
+rc_bigrams <- rc |>
+  unnest_tokens(bigram, cleaned, token = "ngrams", n = 2) 
+
+rc_bigrams_tfidf <- rc_bigrams  |>
+  count(label, bigram) |>
+  bind_tf_idf(bigram, label, n)
+
+bigram_plot <- rc_bigrams_tfidf |>
+  arrange(desc(tf_idf)) |>
+  mutate(bigram = factor(bigram, levels = rev(unique(bigram)))) |> 
+  group_by(label) |> 
+  top_n(10) |> 
+  ungroup() |>
+  ggplot(aes(bigram, tf_idf, fill = label)) +
+  geom_col(show.legend = FALSE) +
+  labs(x = NULL, y = "tf-idf") +
+  coord_flip() +
+  facet_wrap(~factor(label, levels=c('precovid','postcovid')), scales = "free")
+
+title <- expression(atop(bold("Figure 8: Bigram TF-IDF"), scriptstyle("More concentrated topics in pre-COVID period")))
+annotate_figure(bigram_plot,top = text_grob(title, color = "#2ca25f", face = "bold", size = 14))
+
+```
+
+We can even chain together elements of bigrams to see a network of words often mentioned together. It is fascinating to see how each lineage graph draws out a story. the largest web is around the topics discussing the existence of aliens (bottom-left corner), the Chinese protesters on the Tienanmen square, and the Epstein scandal. These are all from the pre-COVID period, while after the pandemic, there's been fewer number of persistent topics.
+
+```{r bigram_network, fig.width=15, fig.height=15}
+
+# visualize
+
+bigrams_separated <- rc_bigrams |>
+  separate(bigram, c("word1", "word2"), sep = " ")
+
+# new bigram counts:
+bigram_counts <- bigrams_separated |> 
+  count(word1, word2, sort = TRUE)
+
+bigram_graph <- bigram_counts |>
+  select(from=word1, to=word2, n=n) |> 
+  filter(n > 20)  |> 
+  graph_from_data_frame()
+
+set.seed(1134)
+
+a <- grid::arrow(type = "closed", length = unit(.15, "inches"))
+
+set.seed(1134)
+
+ggraph(bigram_graph, layout = "fr") +
+  geom_edge_link(aes(edge_alpha = n), show.legend = FALSE,
+                 arrow = a, end_cap = circle(.07, 'inches')) +
+  geom_node_point(color = "lightblue", size = 5) +
+  geom_node_text(aes(label = name), vjust = 1, hjust = 1) +
+  labs(
+    title = "Network of bigrams",
+    subtitle = "Long lineage about Epstein, the aliens, and protests"
+  ) +
+  theme_graph()
+
+```
+
+## Topic Modelling (LDA)
+
+Lastly, I wanted to identify topics of discussion before and after the pandemic using Latent Dirichlet Allocation (LDA). I have used the gensim library to implement LDA.
+
+> LDA, short for Latent Dirichlet Allocation is a technique used for topic modelling. Latent means hidden, something that is yet to be found. Dirichlet indicates that the model assumes that the topics in the documents and the words in those topics follow a Dirichlet distribution. Allocation means to giving something, which in this case are topics. LDA assumes that the documents are generated using a statistical generative process, such that each document is a mixture of topics, and each topics are a mixture of words.
+
+### LDA Tuning
+
+In order to fit the models, we have to determine first what number of topics yields us the best scores in metrics often used for comparison.
+
+To maximize: 
+- [Arun2010](http://doi.org/10.1007/978-3-642-13657-3_43)
+- [Griffiths2004](http://doi.org/10.1073/pnas.0307752101)
+
+To minimize:
+- [CaoJuan2009](http://doi.org/10.1016/j.neucom.2008.06.011)
+- [Deveaud2014](http://doi.org/10.3166/dn.17.1.61-84)
+
+### Pre-COVID
+
+Based on the elbow rule, I set the number of topics to 10. 
+
+```{r prelda1}
+
+predata <- rc |> filter(label == 'precovid') 
+precorpus <- Corpus(VectorSource(predata$cleaned))
+predtm <- DocumentTermMatrix(precorpus)
+
+rowTotals <- apply(predtm , 1, sum) #Find the sum of words in each Document
+predtm.new   <- predtm[rowTotals> 0, ]           #remove all docs without words
+
+
+preresult <- FindTopicsNumber(
+  predtm.new,
+  topics = seq(from = 5, to = 30, by = 5),
+  metrics = c("Griffiths2004", "CaoJuan2009", "Arun2010", "Deveaud2014"),
+  method = "Gibbs",
+  control = list(seed = 1134),
+  verbose = TRUE
+)
+
+FindTopicsNumber_plot(preresult)
+
+```
+We can see that the topics are ranging from aliens to politics connected with Trump. There are a few topics we can label with our domain knowledge.
+
+- Topic 1: The Epstein case
+- Topic 4: Alien and UFO discoveries
+- Topic 6: Google China controversy
+- Topic 7: Social media censorship
+- Topic 8: Trump's impeachment
+- Topic 10: Religion
+
+```{r prelda2, fig.width=12, fig.height=10}
+
+rc_lda <- LDA(predtm.new, k = 10, control = list(seed = 1134))
+rc_topics <- tidy(rc_lda, matrix = "beta")
+
+rc_top_terms <- rc_topics |>
+  group_by(topic) |>
+  top_n(10, beta) |>
+  ungroup() |>
+  arrange(topic, -beta)
+
+prelda <- rc_top_terms |>
+  mutate(term = reorder(term, beta)) |>
+  ggplot(aes(term, beta, fill = factor(topic))) +
+  geom_col(show.legend = FALSE) +
+  labs(
+    x = "",
+    y = ""
+  ) +
+  facet_wrap(~ topic, scales = "free") +
+  coord_flip()
+  
+title <- expression(atop(bold("Figure 9: Topics in pre-COVID period (LDA)"), scriptstyle("Epstein, China vs USA, aliens, censorship, Trump, religion")))
+annotate_figure(prelda,top = text_grob(title, color = "#2ca25f", face = "bold", size = 14))
+
+```
+
+### Post-COVID
+
+Based on the elbow rule, we need to set the number of topics to 20. 
+
+```{r postlda1}
+
+postdata <- rc |> filter(label == 'postcovid') 
+postcorpus <- Corpus(VectorSource(postdata$cleaned))
+postdtm <- DocumentTermMatrix(postcorpus)
+
+rowTotals <- apply(postdtm , 1, sum) #Find the sum of words in each Document
+postdtm.new   <- postdtm[rowTotals> 0, ]           #remove all docs without words
+
+
+postresult <- FindTopicsNumber(
+  postdtm.new,
+  topics = seq(from = 5, to = 30, by = 5),
+  metrics = c("Griffiths2004", "CaoJuan2009", "Arun2010", "Deveaud2014"),
+  method = "Gibbs",
+  control = list(seed = 1134),
+  verbose = TRUE
+)
+
+FindTopicsNumber_plot(postresult)
+
+```
+
+After the pandemic, topics are now ranging from the Ukrainian war through vaccination to social sciences and gender. Other topics are not coherent enough to identify any labels. To name a few topics present here:
+
+- Topic 1: Wayne Snell and Timothy McVeigh white supremacists and terrorist
+- Topic 5: COVID related restrictions and politics (CDC, Canada truck protest)
+- Topic 6: US politics
+- Topic 7: Russian and Ukrainian conflict and a potential nuclear war
+- Topic 17: JFK's assassination
+- Topic 19: Vaccination
+- Topic 13: Social sciences and gender
+
+```{r postlda2, fig.width=12, fig.height=13}
+
+rc_lda <- LDA(postdtm.new, k = 20, control = list(seed = 1134))
+rc_topics <- tidy(rc_lda, matrix = "beta")
+
+rc_top_terms <- rc_topics |>
+  group_by(topic) |>
+  top_n(10, beta) |>
+  ungroup() |>
+  arrange(topic, -beta)
+
+postlda <- rc_top_terms |>
+  mutate(term = reorder(term, beta)) |>
+  ggplot(aes(term, beta, fill = factor(topic))) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~ topic, scales = "free") +
+  coord_flip()
+
+title <- expression(atop(bold("Figure 10: Topics in post-COVID period (LDA)"), scriptstyle("Epstein, China vs USA, aliens, censorship, Trump, religion")))
+annotate_figure(postlda,top = text_grob(title, color = "#2ca25f", face = "bold", size = 14))
+
+```
+
+## Conclusion
+
+For what is worth, I think we learnt a bunch of new thing here and ultimately, my hypothesis held firmly. Since the pandemic, people are using less positive words, their words indicate the questioning of trust which can be backed by the finding where the relative frequency of words classified in the trust sentiment has increased as well as more and more emojis connected to that particular word has emerged. Besides, there are more emojis used which are associated with negative words. Topics in the post-COVID period have been less consistent than in the pre-pandemic phase. Topics in discussion are now about the social science, gender, religion, war rather than sexual scandals and politics.
